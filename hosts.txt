@@ -1,0 +1,5 @@
+zxcpu1.cse.ust.hk
+zxcpu2.cse.ust.hk
+zxcpu3.cse.ust.hk
+zxcpu4.cse.ust.hk
+zxcpu5.cse.ust.hk
