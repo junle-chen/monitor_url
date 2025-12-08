@@ -16,13 +16,13 @@ open ~/.ssh/config
 把
 
 ```
-Host 跳板机
+Host jump_zxf
   ControlMaster auto
   ControlPath ~/.ssh/cm-%r@%h:%p
   ControlPersist 10m
 
 # 2. 针对内网目标机器的优化：全部应用复用
-Host 你的内网机器(example: zxcpu*.cse.ust.hk)
+Host zxcpu*.cse.ust.hk
   ControlMaster auto
   ControlPath ~/.ssh/cm-%r@%h:%p
   ControlPersist 10m
