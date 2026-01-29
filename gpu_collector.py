@@ -67,22 +67,36 @@ def get_nvidia_smi_data():
                 
                 if pids:
                     pid_str = ','.join(pids)
+                    # 获取用户信息
                     ps_cmd = ["ps", "-o", "pid=,user=", "-p", pid_str]
                     ps_res = subprocess.run(ps_cmd, capture_output=True, text=True)
                     if ps_res.returncode == 0:
                         data['user_txt'] = ps_res.stdout.strip()
                     else:
                         data['user_txt'] = ""
+                    
+                    # 获取进程运行时间
+                    etime_cmd = ["ps", "-o", "pid=,etime=", "-p", pid_str]
+                    etime_res = subprocess.run(etime_cmd, capture_output=True, text=True)
+                    if etime_res.returncode == 0:
+                        data['etime_txt'] = etime_res.stdout.strip()
+                    else:
+                        data['etime_txt'] = ""
                 else:
                     data['user_txt'] = ""
+                    data['etime_txt'] = ""
             else:
                 data['user_txt'] = ""
+                data['etime_txt'] = ""
         else:
             data['proc_csv'] = ""
             data['user_txt'] = ""
+            data['etime_txt'] = ""
     except Exception as e:
         data['proc_csv'] = ""
         data['user_txt'] = ""
+        data['etime_txt'] = ""
+
 
     return data
 

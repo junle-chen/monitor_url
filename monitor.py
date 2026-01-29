@@ -103,11 +103,11 @@ def read_from_gist(host):
         
         if response.status_code == 200:
             data = response.json()
-            return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), None
+            return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), data.get("etime_txt", ""), None
         else:
-            return host, None, None, None, f"Gist fetch failed: {response.status_code}"
+            return host, None, None, None, None, f"Gist fetch failed: {response.status_code}"
     except Exception as e:
-        return host, None, None, None, str(e)
+        return host, None, None, None, None, str(e)
 
 
 def read_from_local_file(host):
@@ -123,18 +123,18 @@ def read_from_local_file(host):
 
     try:
         if not os.path.exists(file_path):
-            return host, None, None, None, f"File not found: {file_path}"
+            return host, None, None, None, None, f"File not found: {file_path}"
         
         with open(file_path, "r") as f:
             data = json.load(f)
             
         if "error" in data:
-            return host, None, None, None, f"Collector Error: {data['error']}"
+            return host, None, None, None, None, f"Collector Error: {data['error']}"
 
-        return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), None
+        return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), data.get("etime_txt", ""), None
 
     except Exception as e:
-        return host, None, None, None, str(e)
+        return host, None, None, None, None, str(e)
 
 
 def read_gpu_status(host):
@@ -145,7 +145,7 @@ def read_gpu_status(host):
         return read_from_local_file(host)
 
 
-def parse_data(gpu_csv, proc_csv, user_txt):
+def parse_data(gpu_csv, proc_csv, user_txt, etime_txt=""):
     try:
         gpu_cols = ["idx", "uuid", "name", "mem_used", "mem_total", "util_gpu", "temp"]
         df_gpu = pd.read_csv(
@@ -190,6 +190,22 @@ def parse_data(gpu_csv, proc_csv, user_txt):
             df_proc["user"] = df_proc["user"].fillna("Unknown")
         else:
             df_proc["user"] = "Unknown"
+        
+        # 解析进程运行时间
+        try:
+            if etime_txt:
+                df_etime = pd.read_csv(
+                    StringIO(etime_txt), sep=r"\s+", names=["pid", "run_time"], header=None
+                )
+                df_etime["pid"] = pd.to_numeric(df_etime["pid"], errors="coerce")
+                df_etime = df_etime.dropna(subset=["pid"])
+                df_etime["pid"] = df_etime["pid"].astype(int)
+                df_proc = pd.merge(df_proc, df_etime, on="pid", how="left")
+                df_proc["run_time"] = df_proc["run_time"].fillna("-")
+            else:
+                df_proc["run_time"] = "-"
+        except:
+            df_proc["run_time"] = "-"
 
         if not df_gpu.empty and "uuid" in df_gpu.columns:
             uuid_map = dict(zip(df_gpu["uuid"], df_gpu["idx"]))
@@ -200,6 +216,11 @@ def parse_data(gpu_csv, proc_csv, user_txt):
 
 placeholder = st.empty()
 time_placeholder = st.empty()
+
+# 记录程序启动时间
+from datetime import datetime, timezone, timedelta
+utc8 = timezone(timedelta(hours=8))
+START_TIME = datetime.now(utc8)
 
 try:
     while True:
@@ -213,7 +234,7 @@ try:
 
             cols = st.columns(3) + st.columns(3)
 
-            for i, (host, gpu_raw, proc_raw, user_raw, err) in enumerate(results):
+            for i, (host, gpu_raw, proc_raw, user_raw, etime_raw, err) in enumerate(results):
                 host_name = host.split(".")[0]
                 total_gpu = 0
                 free_gpu = 0
@@ -222,7 +243,7 @@ try:
 
                 df_gpu, df_proc = pd.DataFrame(), pd.DataFrame()
                 if not err and gpu_raw:
-                    df_gpu, df_proc = parse_data(gpu_raw, proc_raw, user_raw)
+                    df_gpu, df_proc = parse_data(gpu_raw, proc_raw, user_raw, etime_raw or "")
                     total_gpu = len(df_gpu)
                     if not df_gpu.empty:
                         free_df = df_gpu[df_gpu["mem_used"] < 500]
@@ -313,8 +334,8 @@ try:
                                             my_procs["process_name"] = my_procs["process_name"].apply(
                                                 lambda x: x.split("/")[-1] if "/" in x else x
                                             )
-                                            display_df = my_procs[["user", "pid", "mem_used", "process_name"]]
-                                            display_df.columns = ["User", "PID", "Mem", "Proc"]
+                                            display_df = my_procs[["user", "mem_used", "process_name", "run_time"]]
+                                            display_df.columns = ["User", "Mem", "Proc", "RunTime"]
                                             st.dataframe(display_df, hide_index=True, use_container_width=True)
                                         else:
                                             st.caption("No active processes")
@@ -340,11 +361,13 @@ try:
                     md_lines.append(f"| {server} | {free} | {free_gpus} | {used_gpus} | {status} |")
                 st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
-        # 使用 UTC+8 时区显示时间
-        from datetime import datetime, timezone, timedelta
-        utc8 = timezone(timedelta(hours=8))
-        now_utc8 = datetime.now(utc8).strftime('%H:%M:%S')
-        time_placeholder.caption(f"Last updated: {now_utc8} (UTC+8)")
+        # 使用 UTC+8 时区显示时间和运行时长
+        now_utc8 = datetime.now(utc8)
+        uptime = now_utc8 - START_TIME
+        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s" if hours > 0 else f"{minutes}m {seconds}s"
+        time_placeholder.caption(f"Last updated: {now_utc8.strftime('%H:%M:%S')} (UTC+8) | Running: {uptime_str}")
         time.sleep(10)
 
 except Exception:
