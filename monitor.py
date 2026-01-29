@@ -340,7 +340,12 @@ try:
                     md_lines.append(f"| {server} | {free} | {free_gpus} | {used_gpus} | {status} |")
                 st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
-        time_placeholder.caption(f"Last updated: {time.strftime('%H:%M:%S')}")
-        time.sleep(15)
+        # 使用 UTC+8 时区显示时间
+        from datetime import datetime, timezone, timedelta
+        utc8 = timezone(timedelta(hours=8))
+        now_utc8 = datetime.now(utc8).strftime('%H:%M:%S')
+        time_placeholder.caption(f"Last updated: {now_utc8} (UTC+8)")
+        time.sleep(10)
+
 except Exception:
     pass
