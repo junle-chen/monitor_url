@@ -3,15 +3,22 @@ import streamlit.components.v1 as components
 import pandas as pd
 import time
 import os
-import signal
 import json
-import socket
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 # ================= 配置区域 =================
-# 定义要监控的主机列表
+# 监控的主机列表
 HOSTS = [f"zxcpu{i}" for i in range(1, 6)]
+
+# GitHub Gist 配置 (用于 Streamlit Cloud 部署)
+# 设置为 None 时使用本地文件模式
+GIST_ID = os.environ.get("GIST_ID", None)
+
+# 本地模式路径配置
+LOCAL_STATUS_FILE = "status.json"
+NFS_PATH_TEMPLATE = "/export/{host}/junle/monitor/status.json"
 # ===========================================
 
 st.set_page_config(
@@ -82,29 +89,33 @@ components.html(
     width=0,
 )
 
-def read_gpu_status_file(host):
-    """
-    Read status.json for the given host.
-    Logic:
-    - If host is current hostname, read locally: ./status.json
-    - Else, read from NFS: /export/<host>/junle/monitor/status.json
-    """
+
+def read_from_gist(host):
+    """Read status data from GitHub Gist."""
+    try:
+        # Raw Gist URL format
+        url = f"https://gist.githubusercontent.com/raw/{GIST_ID}/{host}.json"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), None
+        else:
+            return host, None, None, None, f"Gist fetch failed: {response.status_code}"
+    except Exception as e:
+        return host, None, None, None, str(e)
+
+
+def read_from_local_file(host):
+    """Read status data from local/NFS file."""
+    import socket
     current_host = socket.gethostname()
-    host_clean = host.split(".")[0] # handle qualified names if any
+    host_clean = host.split(".")[0]
     
-    # Path construction
     if host == current_host or host == "localhost":
-        # Assume usage in the same directory as this script
-        file_path = "status.json"
+        file_path = LOCAL_STATUS_FILE
     else:
-        # Construct NFS path based on user description
-        # /export/zxcpuX/junle/monitor/status.json
-        # NOTE: user said /export/zxcpux/junle access works. 
-        # I am adding 'monitor' subdir assumption because that's where we are.
-        # If user puts it directly in junle, we might need adjustment.
-        # Given the previous context, it's safer to check both or assume structure. 
-        # I will stick to the 'monitor' subdir as that's where I placed the collector.
-        file_path = f"/export/{host_clean}/junle/monitor/status.json"
+        file_path = NFS_PATH_TEMPLATE.format(host=host_clean)
 
     try:
         if not os.path.exists(file_path):
@@ -113,16 +124,21 @@ def read_gpu_status_file(host):
         with open(file_path, "r") as f:
             data = json.load(f)
             
-        # Check freshness (e.g., if file is older than 2 minutes, warn?)
-        # For now just return data
-        
         if "error" in data:
-             return host, None, None, None, f"Collector Error: {data['error']}"
+            return host, None, None, None, f"Collector Error: {data['error']}"
 
         return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), None
 
     except Exception as e:
         return host, None, None, None, str(e)
+
+
+def read_gpu_status(host):
+    """Read GPU status - auto-selects Gist or local mode."""
+    if GIST_ID:
+        return read_from_gist(host)
+    else:
+        return read_from_local_file(host)
 
 
 def parse_data(gpu_csv, proc_csv, user_txt):
@@ -188,38 +204,32 @@ try:
         stats_list = []
 
         with placeholder.container():
-            # Use simple loop or threadpool (file I/O is fast but network FS might lag)
             with ThreadPoolExecutor(max_workers=len(HOSTS)) as executor:
-                results = list(executor.map(read_gpu_status_file, HOSTS))
+                results = list(executor.map(read_gpu_status, HOSTS))
 
             cols = st.columns(3) + st.columns(3)
 
             for i, (host, gpu_raw, proc_raw, user_raw, err) in enumerate(results):
-                # 先计算该主机的可用 GPU 数量，用于侧边栏统计
                 host_name = host.split(".")[0]
                 total_gpu = 0
                 free_gpu = 0
                 free_gpu_ids = "-"
                 used_gpu_info = "-"
 
-                # 数据解析
                 df_gpu, df_proc = pd.DataFrame(), pd.DataFrame()
                 if not err and gpu_raw:
                     df_gpu, df_proc = parse_data(gpu_raw, proc_raw, user_raw)
                     total_gpu = len(df_gpu)
-                    # 计算 Free: 显存 < 500 MiB 视为 Free
                     if not df_gpu.empty:
                         free_df = df_gpu[df_gpu["mem_used"] < 500]
                         free_gpu = len(free_df)
                         if not free_df.empty:
-                            # 记录空闲 GPU 的 ID 列表，例如 "GPU 0, 1, 3"
                             try:
                                 ids = [str(int(idx)) for idx in free_df["idx"]]
                             except Exception:
                                 ids = [str(idx) for idx in free_df["idx"]]
                             if ids:
                                 free_gpu_ids = "GPU " + ", ".join(ids)
-                        # 计算非 Free GPU 的显存使用情况，多行显示
                         used_df = df_gpu[df_gpu["mem_used"] >= 500]
                         if not used_df.empty:
                             lines = []
@@ -230,18 +240,13 @@ try:
                                     mem_total_mb = float(row["mem_total"])
                                 except Exception:
                                     continue
-                                mem_used_g = (
-                                    mem_used_mb / 1024.0 if mem_total_mb > 0 else 0
-                                )
-                                mem_total_g = (
-                                    mem_total_mb / 1024.0 if mem_total_mb > 0 else 0
-                                )
+                                mem_used_g = mem_used_mb / 1024.0 if mem_total_mb > 0 else 0
+                                mem_total_g = mem_total_mb / 1024.0 if mem_total_mb > 0 else 0
                                 line = f"GPU {gpu_idx}: {int(mem_used_g)}G / {int(mem_total_g)}G"
                                 lines.append(line)
                             if lines:
                                 used_gpu_info = "\n".join(lines)
 
-                # 存入统计列表
                 stats_list.append(
                     {
                         "Server": host_name,
@@ -256,12 +261,10 @@ try:
                     }
                 )
 
-                # --- 下面是主界面的渲染逻辑 ---
                 if i >= len(cols):
                     continue
                 with cols[i]:
                     st.subheader(f"🖥️ {host_name}")
-                    # 折叠区域：GPU 详细信息
                     with st.expander("GPU 详情", expanded=False):
                         if err:
                             st.error(err)
@@ -300,40 +303,15 @@ try:
                                         label_visibility="collapsed",
                                     )
 
-                                    if (
-                                        not df_proc.empty
-                                        and "gpu_idx" in df_proc.columns
-                                    ):
-                                        my_procs = df_proc[
-                                            df_proc["gpu_idx"] == gpu_idx
-                                        ].copy()
+                                    if not df_proc.empty and "gpu_idx" in df_proc.columns:
+                                        my_procs = df_proc[df_proc["gpu_idx"] == gpu_idx].copy()
                                         if not my_procs.empty:
-                                            my_procs["process_name"] = my_procs[
-                                                "process_name"
-                                            ].apply(
-                                                lambda x: (
-                                                    x.split("/")[-1] if "/" in x else x
-                                                )
+                                            my_procs["process_name"] = my_procs["process_name"].apply(
+                                                lambda x: x.split("/")[-1] if "/" in x else x
                                             )
-                                            display_df = my_procs[
-                                                [
-                                                    "user",
-                                                    "pid",
-                                                    "mem_used",
-                                                    "process_name",
-                                                ]
-                                            ]
-                                            display_df.columns = [
-                                                "User",
-                                                "PID",
-                                                "Mem",
-                                                "Proc",
-                                            ]
-                                            st.dataframe(
-                                                display_df,
-                                                hide_index=True,
-                                                use_container_width=True,
-                                            )
+                                            display_df = my_procs[["user", "pid", "mem_used", "process_name"]]
+                                            display_df.columns = ["User", "PID", "Mem", "Proc"]
+                                            st.dataframe(display_df, hide_index=True, use_container_width=True)
                                         else:
                                             st.caption("No active processes")
                                     else:
@@ -341,10 +319,8 @@ try:
                         else:
                             st.warning("No GPU Info")
 
-        # 循环结束后，统一更新侧边栏状态
         with status_placeholder.container():
             if stats_list:
-                # 使用 Markdown 表格手动渲染，使 Used GPUs 列可以通过 <br> 多行显示
                 headers = ["Server", "Free", "Free GPUs", "Used GPUs", "Status"]
                 md_lines = [
                     "| " + " | ".join(headers) + " |",
@@ -355,23 +331,12 @@ try:
                     free = row.get("Free", "")
                     free_gpus = row.get("Free GPUs", "")
                     used_gpus_raw = row.get("Used GPUs", "-") or "-"
-                    # 将 \n 换成 <br>，在单元格内真正换行
                     used_gpus = used_gpus_raw.replace("\n", "<br>")
                     status = row.get("Status", "")
-                    md_lines.append(
-                        f"| {server} | {free} | {free_gpus} | {used_gpus} | {status} |"
-                    )
+                    md_lines.append(f"| {server} | {free} | {free_gpus} | {used_gpus} | {status} |")
                 st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
         time_placeholder.caption(f"Last updated: {time.strftime('%H:%M:%S')}")
-        time.sleep(15) # Refresh every 15 seconds to match collector default
+        time.sleep(15)
 except Exception:
     pass
-
-finally:
-    # 只要脚本停止运行（包括关闭网页、刷新网页），就杀死进程
-    print("Browser closed or refreshed. Killing process...")
-    try:
-        os.kill(os.getpid(), signal.SIGTERM)
-    except:
-        pass
