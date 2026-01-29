@@ -13,13 +13,17 @@ from io import StringIO
 HOSTS = [f"zxcpu{i}" for i in range(1, 6)]
 
 # GitHub Gist 配置 (用于 Streamlit Cloud 部署)
-# 设置为 None 时使用本地文件模式
-GIST_ID = os.environ.get("GIST_ID", None)
+# 优先从 st.secrets 读取 (Streamlit Cloud)，否则从环境变量读取
+try:
+    GIST_ID = st.secrets.get("GIST_ID", None)
+except:
+    GIST_ID = os.environ.get("GIST_ID", None)
 
 # 本地模式路径配置
 LOCAL_STATUS_FILE = "status.json"
 NFS_PATH_TEMPLATE = "/export/{host}/junle/monitor/status.json"
 # ===========================================
+
 
 st.set_page_config(
     page_title="CSE GPU Cluster",
