@@ -1,29 +1,17 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import subprocess
 import pandas as pd
 import time
 import os
 import signal
+import json
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
-
 # ================= 配置区域 =================
-# 从 hosts.txt 文件读取主机列表
-def load_hosts():
-    try:
-        with open("hosts.txt", "r") as f:
-            return [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        st.error(
-            "hosts.txt file not found! you need to create it with the list of hostnames or IPs."
-        )
-        return []
-
-
-HOSTS = load_hosts()
-SSH_USER = None
+# 定义要监控的主机列表
+HOSTS = [f"zxcpu{i}" for i in range(1, 6)]
 # ===========================================
 
 st.set_page_config(
@@ -94,52 +82,44 @@ components.html(
     width=0,
 )
 
-
-def get_gpu_status(host):
-    target = f"{SSH_USER}@{host}" if SSH_USER else host
-
-    bash_script = """
-    export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-    
-    # [1] GPU Info
-    nvidia-smi --query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits
-    echo "|||SPLIT|||"
-    
-    # [2] Process Info
-    nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader,nounits
-    echo "|||SPLIT|||"
-    
-    # [3] User Info
-    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | paste -sd, -)
-    if [ ! -z "$pids" ]; then
-        ps -o pid=,user= -p "$pids"
-    fi
+def read_gpu_status_file(host):
     """
+    Read status.json for the given host.
+    Logic:
+    - If host is current hostname, read locally: ./status.json
+    - Else, read from NFS: /export/<host>/junle/monitor/status.json
+    """
+    current_host = socket.gethostname()
+    host_clean = host.split(".")[0] # handle qualified names if any
+    
+    # Path construction
+    if host == current_host or host == "localhost":
+        # Assume usage in the same directory as this script
+        file_path = "status.json"
+    else:
+        # Construct NFS path based on user description
+        # /export/zxcpuX/junle/monitor/status.json
+        # NOTE: user said /export/zxcpux/junle access works. 
+        # I am adding 'monitor' subdir assumption because that's where we are.
+        # If user puts it directly in junle, we might need adjustment.
+        # Given the previous context, it's safer to check both or assume structure. 
+        # I will stick to the 'monitor' subdir as that's where I placed the collector.
+        file_path = f"/export/{host_clean}/junle/monitor/status.json"
 
     try:
-        ssh = [
-            "ssh",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "LogLevel=ERROR",
-            target,
-            f"bash -c '{bash_script}'",
-        ]
-        result = subprocess.run(ssh, capture_output=True, text=True, timeout=10)
+        if not os.path.exists(file_path):
+            return host, None, None, None, f"File not found: {file_path}"
+        
+        with open(file_path, "r") as f:
+            data = json.load(f)
+            
+        # Check freshness (e.g., if file is older than 2 minutes, warn?)
+        # For now just return data
+        
+        if "error" in data:
+             return host, None, None, None, f"Collector Error: {data['error']}"
 
-        if result.returncode != 0:
-            return host, None, None, None, f"SSH Err: {result.stderr.strip()}"
-
-        output = result.stdout.strip()
-        parts = output.split("|||SPLIT|||")
-
-        if len(parts) >= 3:
-            return host, parts[0].strip(), parts[1].strip(), parts[2].strip(), None
-        else:
-            return host, parts[0].strip(), "", "", None
+        return host, data.get("gpu_csv", ""), data.get("proc_csv", ""), data.get("user_txt", ""), None
 
     except Exception as e:
         return host, None, None, None, str(e)
@@ -204,11 +184,13 @@ time_placeholder = st.empty()
 try:
     while True:
         # 准备收集统计数据
+        print(f"[{time.strftime('%H:%M:%S')}] Refreshing data...", flush=True)
         stats_list = []
 
         with placeholder.container():
+            # Use simple loop or threadpool (file I/O is fast but network FS might lag)
             with ThreadPoolExecutor(max_workers=len(HOSTS)) as executor:
-                results = list(executor.map(get_gpu_status, HOSTS))
+                results = list(executor.map(read_gpu_status_file, HOSTS))
 
             cols = st.columns(3) + st.columns(3)
 
@@ -382,11 +364,14 @@ try:
                 st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
         time_placeholder.caption(f"Last updated: {time.strftime('%H:%M:%S')}")
-        time.sleep(60)
+        time.sleep(15) # Refresh every 15 seconds to match collector default
 except Exception:
     pass
 
 finally:
     # 只要脚本停止运行（包括关闭网页、刷新网页），就杀死进程
     print("Browser closed or refreshed. Killing process...")
-    os.kill(os.getpid(), signal.SIGTERM)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except:
+        pass
